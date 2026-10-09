@@ -24,9 +24,10 @@ Examples:
 import sys
 import time
 import socket
+import struct
 import argparse
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 try:
     import ntplib
@@ -86,31 +87,44 @@ TIMEOUT = 5  # seconds
 # Helper Functions
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_reference_clock(ref_id: str) -> str:
-    """Convert a 4-character reference clock ID to a human-readable string."""
-    # Check direct match
-    if ref_id in REFERENCE_CLOCKS:
-        return REFERENCE_CLOCKS[ref_id]
+def _ref_id_to_bytes(ref_id: Union[int, bytes, str]) -> Optional[bytes]:
+    """Pack an ntplib ref_id into the 4 bytes carried in the NTP packet.
 
-    # Try with trailing space stripped
-    stripped = ref_id.strip()
-    if stripped in REFERENCE_CLOCKS:
-        return REFERENCE_CLOCKS[stripped]
+    ntplib leaves this field as the raw unsigned 32-bit integer from the
+    packet. Older call sites sometimes pass the ASCII form instead.
+    """
+    if isinstance(ref_id, int):
+        return struct.pack("!I", ref_id & 0xFFFFFFFF)
+    if isinstance(ref_id, (bytes, bytearray)):
+        return bytes(ref_id[:4]).ljust(4, b"\x00")
+    if isinstance(ref_id, str) and len(ref_id.encode("latin-1", errors="replace")) <= 4:
+        return ref_id.encode("latin-1", errors="replace").ljust(4, b"\x00")
+    return None
 
-    # For stratum 1 servers, it's a 4-char ASCII identifier
-    # For stratum 2+, it's an IPv4 address
-    try:
-        # Check if it looks like an IP address (4 bytes packed as a string)
-        ip_bytes = ref_id.encode('latin-1')
-        if len(ip_bytes) == 4:
-            ip_addr = f"{ip_bytes[0]}.{ip_bytes[1]}.{ip_bytes[2]}.{ip_bytes[3]}"
-            # Filter out obviously non-IP values
-            if all(0 <= b <= 255 for b in ip_bytes):
-                return ip_addr
-    except Exception:
-        pass
 
-    return ref_id.strip()
+def resolve_reference_clock(
+    ref_id: Union[int, bytes, str],
+    stratum: Optional[int] = None,
+) -> Tuple[str, str]:
+    """Return (identifier, description) for an NTP reference identifier.
+
+    Stratum 0 and 1 pack a 4-character ASCII clock id (for example GPS).
+    Stratum 2 and above pack the reference peer's IPv4 address.
+    """
+    raw = _ref_id_to_bytes(ref_id)
+    if raw is None:
+        text = str(ref_id).strip()
+        return text, REFERENCE_CLOCKS.get(text, text)
+
+    if stratum is not None and stratum >= 2:
+        ip_addr = socket.inet_ntoa(raw)
+        return ip_addr, ip_addr
+
+    text = raw.decode("ascii", errors="replace").rstrip("\x00").strip()
+    if not text:
+        return "----", "unspecified"
+    description = REFERENCE_CLOCKS.get(text, text)
+    return text, description
 
 
 def format_timestamp(ntp_timestamp: float) -> str:
@@ -197,8 +211,11 @@ def test_ntp_server(server: str, version: int = NTP_VERSION) -> dict:
     # Populate results
     result["reachable"] = True
     result["stratum"] = response.stratum
-    result["ref_clock"] = response.ref_id
-    result["ref_clock_desc"] = resolve_reference_clock(response.ref_id)
+    ref_clock, ref_clock_desc = resolve_reference_clock(
+        response.ref_id, response.stratum
+    )
+    result["ref_clock"] = ref_clock
+    result["ref_clock_desc"] = ref_clock_desc
     result["transmit_time"] = format_timestamp(response.tx_time)
     result["offset_raw"] = response.offset
     result["offset"] = format_offset(response.offset)
